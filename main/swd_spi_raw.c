@@ -51,7 +51,7 @@ esp_err_t swd_spi_init(gpio_num_t swclk, gpio_num_t swdio, uint32_t freq_hz, spi
     spi_bus_config.quadwp_io_num   = -1;
     spi_bus_config.quadhd_io_num   = -1;
     spi_bus_config.max_transfer_sz = 0;
-    spi_bus_config.flags = SPICOMMON_BUSFLAG_IOMUX_PINS;
+    // spi_bus_config.flags = SPICOMMON_BUSFLAG_IOMUX_PINS;
 
     esp_err_t ret = spi_bus_initialize(host, &spi_bus_config, 0);
     if (ret != ESP_OK) {
@@ -132,16 +132,20 @@ void swd_spi_send_cycles(uint32_t clk_cycles, uint32_t swclk_level)
     spi_dev->user.usr_command = 0;
     spi_dev->user.usr_mosi = 1;
     spi_dev->user.usr_miso = 0;
-    spi_dev->misc.ck_idle_edge = 0;
+    //spi_dev->misc.ck_idle_edge = 0;
 //    spi_dev->user.usr_hold_pol = 1;
 //    spi_dev->user.usr_dout_hold = 0;
-    spi_dev->user.ck_out_edge = 0;
+   // spi_dev->user.ck_out_edge = 0;
+    spi_dev->ms_dlen.ms_data_bitlen = clk_cycles - 1;
 
     for (uint32_t idx = 0; idx < 18; idx++) {
         spi_dev->data_buf[idx] = swclk_level;
     }
 
-    spi_dev->ms_dlen.ms_data_bitlen = clk_cycles - 1;
+
+    spi_dev->cmd.update = 1;
+    while (spi_dev->cmd.update);
+
     spi_dev->cmd.usr = 1; // Trigger Tx!!
 }
 
@@ -172,8 +176,8 @@ esp_err_t swd_spi_send_bits(uint8_t *bits, size_t bit_len)
     spi_dev->user.usr_mosi = 1;
     spi_dev->user.usr_miso = 0;
     spi_dev->user.sio = 1;
-    spi_dev->misc.ck_idle_edge = 0;
-    spi_dev->user.ck_out_edge = 0;
+//    spi_dev->misc.ck_idle_edge = 0;
+//    spi_dev->user.ck_out_edge = 0;
 
     switch (bit_len) {
         case 8: {
@@ -216,6 +220,10 @@ esp_err_t swd_spi_send_bits(uint8_t *bits, size_t bit_len)
     }
 
     spi_dev->ms_dlen.ms_data_bitlen = bit_len - 1;
+
+    spi_dev->cmd.update = 1;
+    while (spi_dev->cmd.update);
+
     spi_dev->cmd.usr = 1; // Trigger Tx!!
 
     if (swd_spi_wait_till_ready(1000) != ESP_OK) {
@@ -240,10 +248,13 @@ esp_err_t swd_spi_recv_bits(uint8_t *bits, size_t bit_len)
     spi_dev->user.usr_command = 0;
     spi_dev->user.usr_mosi = 0;
     spi_dev->user.usr_miso = 1;
-    spi_dev->misc.ck_idle_edge = 0;
-    spi_dev->user.ck_out_edge = 0;
+//    spi_dev->misc.ck_idle_edge = 0;
+//    spi_dev->user.ck_out_edge = 0;
     spi_dev->user.sio = 1;
     spi_dev->ms_dlen.ms_data_bitlen = bit_len - 1;
+    spi_dev->cmd.update = 1;
+    while (spi_dev->cmd.update);
+
     spi_dev->cmd.usr = 1; //Trigger Rx!!
     if (swd_spi_wait_till_ready(1000) != ESP_OK) {
         ESP_LOGE(TAG, "Read bit timeout");
@@ -280,11 +291,11 @@ esp_err_t swd_spi_switch()
 
 static uint8_t swd_spi_transfer(uint32_t req, uint32_t *data)
 {
-    const uint8_t constantBits = 0b10000001U; /* Start Bit  & Stop Bit & Park Bit is fixed. */
-    uint8_t requestByte = constantBits | (((uint8_t)(req & 0xFU)) << 1U) | (calc_parity_u8(req & 0xFU) << 5U);
+    const uint8_t const_start_stop_bits = 0b10000001U; /* Start Bit  & Stop Bit & Park Bit is fixed. */
+    uint8_t req_byte = const_start_stop_bits | (((uint8_t)(req & 0xFU)) << 1U) | (calc_parity_u8(req & 0xFU) << 5U);
 
     uint8_t ack = 0;
-    swd_spi_send_header(requestByte, &ack, 0);
+    swd_spi_send_header(req_byte, &ack, 0);
 
     uint32_t data_read = 0;
     uint8_t parity_read = 0;
@@ -331,11 +342,13 @@ esp_err_t swd_spi_send_header(uint8_t header_data, uint8_t *ack, uint8_t trn_aft
 
     spi_dev->user.usr_miso = 1;
     spi_dev->user.sio = 1;
-    spi_dev->misc.ck_idle_edge = 0;
-    spi_dev->user.ck_out_edge = 0;
+//    spi_dev->misc.ck_idle_edge = 0;
+//    spi_dev->user.ck_out_edge = 0;
 
     spi_dev->ms_dlen.ms_data_bitlen = 1 + 3 + trn_after_ack - 1; // 1 bit Trn(Before ACK) + 3bits ACK + TrnAfterACK  - 1(prescribed)
     spi_dev->data_buf[0] = (header_data << 0) | (0U << 8) | (0U << 16) | (0U << 24);
+    spi_dev->cmd.update = 1;
+    while (spi_dev->cmd.update);
 
     spi_dev->cmd.usr = 1;
     if (swd_spi_wait_till_ready(1000) != ESP_OK) {
@@ -362,6 +375,10 @@ esp_err_t swd_spi_read_data(uint32_t *data_out, uint8_t *parity_out)
 
     // 1 bit Trn(End) + 3bits ACK + 32bis data + 1bit parity - 1(prescribed)
     spi_dev->ms_dlen.ms_data_bitlen = 1 + 32 + 1 - 1;
+
+    spi_dev->cmd.update = 1;
+    while (spi_dev->cmd.update);
+
     spi_dev->cmd.usr = 1;
     if (swd_spi_wait_till_ready(10000) != ESP_OK) {
         ESP_LOGE(TAG, "Read data timeout");
@@ -388,6 +405,10 @@ esp_err_t swd_spi_write_data(uint32_t data, uint8_t parity)
     spi_dev->ms_dlen.ms_data_bitlen = 32 + 1 - 1;
     spi_dev->data_buf[0] = data;
     spi_dev->data_buf[1] = parity;
+
+    spi_dev->cmd.update = 1;
+    while (spi_dev->cmd.update);
+
 
     spi_dev->cmd.usr = 1;
     if (swd_spi_wait_till_ready(10000) != ESP_OK) {
