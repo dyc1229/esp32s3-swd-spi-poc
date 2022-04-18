@@ -1,2 +1,3 @@
-idf_component_register(SRCS "poc_main.c" "swd_spi.c" "swd_spi.h"
-                    INCLUDE_DIRS ".")
+idf_component_register(SRCS "poc_main.cpp" "swd_spi_raw.c" "swd_spi_raw.h"
+                    INCLUDE_DIRS "."
+        REQUIRES driver hal)

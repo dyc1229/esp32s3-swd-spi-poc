@@ -2,8 +2,9 @@
 #include <driver/spi_master.h>
 #include <esp_log.h>
 #include <soc/spi_struct.h>
+#include <hal/spi_ll.h>
 #include <string.h>
-#include "swd_spi.h"
+#include "swd_spi_raw.h"
 
 #ifdef TAG
 #undef TAG
@@ -14,9 +15,31 @@
 static spi_device_handle_t spi_handle = NULL;
 static volatile spi_dev_t *spi_dev = (volatile spi_dev_t *)(DR_REG_SPI2_BASE);
 
+static const uint8_t parity_table[256] = {
+    #define P2(n) n, n^1, n^1, n
+    #define P4(n) P2(n), P2(n^1), P2(n^1), P2(n)
+    #define P6(n) P4(n), P4(n^1), P4(n^1), P4(n)
+
+    P6(0), P6(1), P6(1), P6(0)
+};
+
 static inline size_t div_round_up(size_t a, size_t b)
 {
     return (a + b - 1) / b;
+}
+
+static inline uint8_t calc_parity_u32(uint32_t v)
+{
+    v ^= v >> 16;
+    v ^= v >> 8;
+    v ^= v >> 4;
+    v &= 0xf;
+    return (0x6996 >> v) & 1;
+}
+
+static inline uint8_t calc_parity_u8(uint8_t v)
+{
+    return parity_table[v];
 }
 
 esp_err_t swd_spi_init(gpio_num_t swclk, gpio_num_t swdio, uint32_t freq_hz, spi_host_device_t host)
@@ -122,40 +145,19 @@ void swd_spi_send_cycles(uint32_t clk_cycles, uint32_t swclk_level)
     spi_dev->cmd.usr = 1; // Trigger Tx!!
 }
 
-void swd_spi_send_send_swj_sequence()
-{
-    const uint16_t seq = 0xE79E;
-    swd_spi_send_cycles(51, 0xffffffff);
-    while(spi_dev->cmd.usr != 0);
-    swd_spi_send_cycles(seq, 16);
-    while(spi_dev->cmd.usr != 0);
-    swd_spi_send_cycles(51, 0xffffffff);
-    while(spi_dev->cmd.usr != 0);
-}
-
-esp_err_t swd_spi_recv_pkt(uint8_t reg, uint32_t *out_word, uint16_t retry_cnt)
-{
-    return 0;
-}
-
-esp_err_t swd_spi_read_dp(uint8_t reg, uint32_t *out_word)
-{
-    return 0;
-}
-
-uint8_t swd_spi_calc_parity_req(uint8_t reg)
-{
-    return 0;
-}
-
-uint32_t swd_spi_calc_parity_32(uint32_t reg)
-{
-    return 0;
-}
-
 esp_err_t swd_spi_read_idcode(uint32_t *idcode)
 {
-    return 0;
+    uint8_t tmp_in[1];
+    uint8_t tmp_out[4];
+    tmp_in[0] = 0x00;
+    swd_spi_send_bits(tmp_in, 8);
+
+    if (swd_spi_read_dp(0, (uint32_t *)tmp_out) != 0x01) {
+        return ESP_FAIL;
+    }
+
+    *idcode = (tmp_out[3] << 24) | (tmp_out[2] << 16) | (tmp_out[1] << 8) | tmp_out[0];
+    return ESP_OK;
 }
 
 esp_err_t swd_spi_send_bits(uint8_t *bits, size_t bit_len)
@@ -265,4 +267,133 @@ esp_err_t swd_spi_reset()
 {
     uint8_t tmp[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     return swd_spi_send_bits(tmp, 51);
+}
+
+esp_err_t swd_spi_switch()
+{
+    const uint16_t swj_magic = 0xE79E;
+    uint8_t tmp_in[2];
+    tmp_in[0] = swj_magic & 0xff;
+    tmp_in[1] = (swj_magic >> 8) & 0xff;
+    return swd_spi_send_bits(tmp_in, 16);
+}
+
+static uint8_t swd_spi_transfer(uint32_t req, uint32_t *data)
+{
+    const uint8_t constantBits = 0b10000001U; /* Start Bit  & Stop Bit & Park Bit is fixed. */
+    uint8_t requestByte = constantBits | (((uint8_t)(req & 0xFU)) << 1U) | (calc_parity_u8(req & 0xFU) << 5U);
+
+    uint8_t ack = 0;
+    swd_spi_send_header(requestByte, &ack, 0);
+
+    uint32_t data_read = 0;
+    uint8_t parity_read = 0;
+    swd_spi_read_data(&data_read, &parity_read);
+
+    ESP_LOGI(TAG, "Ack: 0x%x, data read: 0x%x, parity read: 0x%x", ack, data_read, parity_read);
+
+    return ack;
+}
+
+uint8_t swd_spi_read_dp(uint8_t adr, uint32_t *val)
+{
+    uint32_t tmp_in;
+    uint8_t tmp_out[4];
+    uint8_t ack;
+    uint32_t tmp;
+    tmp_in = SWD_REG_DP | SWD_REG_R | SWD_REG_ADR(adr);
+    ack = swd_spi_transfer(tmp_in, (uint32_t *)tmp_out);
+    *val = 0;
+    tmp = tmp_out[3];
+    *val |= (tmp << 24);
+    tmp = tmp_out[2];
+    *val |= (tmp << 16);
+    tmp = tmp_out[1];
+    *val |= (tmp << 8);
+    tmp = tmp_out[0];
+    *val |= (tmp << 0);
+    return (ack == 0x01);
+}
+
+uint8_t swd_spi_transfer_retry(uint32_t req, uint32_t *data)
+{
+    return 0;
+}
+
+esp_err_t swd_spi_send_header(uint8_t header_data, uint8_t *ack, uint8_t trn_after_ack)
+{
+    uint32_t data_buf = 0;
+    spi_dev->user.usr_dummy = 0;
+    spi_dev->user.usr_command = 0;
+    spi_dev->user.usr_mosi = 1;
+
+    spi_dev->ms_dlen.ms_data_bitlen = 7; // 8 bits
+
+    spi_dev->user.usr_miso = 1;
+    spi_dev->user.sio = 1;
+    spi_dev->misc.ck_idle_edge = 0;
+    spi_dev->user.ck_out_edge = 0;
+
+    spi_dev->ms_dlen.ms_data_bitlen = 1 + 3 + trn_after_ack - 1; // 1 bit Trn(Before ACK) + 3bits ACK + TrnAfterACK  - 1(prescribed)
+    spi_dev->data_buf[0] = (header_data << 0) | (0U << 8) | (0U << 16) | (0U << 24);
+
+    spi_dev->cmd.usr = 1;
+    if (swd_spi_wait_till_ready(1000) != ESP_OK) {
+        ESP_LOGE(TAG, "Read bit timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
+
+    data_buf = spi_dev->data_buf[0];
+    *ack = (data_buf >> 1) & 0b111;
+
+    return ESP_OK;
+}
+
+esp_err_t swd_spi_read_data(uint32_t *data_out, uint8_t *parity_out)
+{
+    volatile uint64_t data_buf;
+    uint32_t *data_u32_p = (uint32_t *)&data_buf;
+
+    spi_dev->user.usr_dummy = 0;
+    spi_dev->user.usr_command = 0;
+    spi_dev->user.usr_mosi = 0;
+    spi_dev->user.usr_miso = 1;
+
+    // 1 bit Trn(End) + 3bits ACK + 32bis data + 1bit parity - 1(prescribed)
+    spi_dev->ms_dlen.ms_data_bitlen = 1 + 32 + 1 - 1;
+    spi_dev->cmd.usr = 1;
+    if (swd_spi_wait_till_ready(10000) != ESP_OK) {
+        ESP_LOGE(TAG, "Read data timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    data_u32_p[0] = spi_dev->data_buf[0];
+    data_u32_p[1] = spi_dev->data_buf[1];
+
+    *data_out = (data_buf >> 0U) & 0xFFFFFFFFU;  // 32bits Response Data
+    *parity_out = (data_buf >> (0U + 32U)) & 1U; // 3bits ACK + 32bis data
+
+    return ESP_OK;
+}
+
+esp_err_t swd_spi_write_data(uint32_t data, uint8_t parity)
+{
+    spi_dev->user.usr_dummy = 0;
+    spi_dev->user.usr_command = 0;
+    spi_dev->user.usr_mosi = 1;
+    spi_dev->user.usr_miso = 0;
+
+    // 1 bit Trn(End) + 3bits ACK + 32bis data + 1bit parity - 1(prescribed)
+    spi_dev->ms_dlen.ms_data_bitlen = 32 + 1 - 1;
+    spi_dev->data_buf[0] = data;
+    spi_dev->data_buf[1] = parity;
+
+    spi_dev->cmd.usr = 1;
+    if (swd_spi_wait_till_ready(10000) != ESP_OK) {
+        ESP_LOGE(TAG, "Write data timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return ESP_OK;
 }
